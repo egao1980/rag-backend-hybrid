@@ -109,6 +109,32 @@
   (ok (signals (rag-backend-hybrid:make-hybrid-store)
                'rag-protocol:rag-error)))
 
+(deftest bm25-analyzer-stems
+  (let ((store (rag-backend-hybrid:make-bm25-store
+                :analyzer (rag-protocol:make-simple-analyzer
+                           :stemmer :porter :stopwords :english))))
+    (rag-protocol:upsert store
+                         (list (%chunk "a" "the running cats")
+                               (%chunk "b" "blue car")))
+    (let ((hits (rag-protocol:query-store store "run cat" :top-k 1)))
+      (ok (equal "a" (rag-protocol:rag-chunk-id
+                      (rag-protocol:rag-hit-chunk (first hits))))))))
+
+(deftest hybrid-linear-fusion
+  (let* ((dense (rag-protocol:make-mock-vector-store))
+         (store (rag-backend-hybrid:make-hybrid-store
+                 :vector-store dense
+                 :fusion :linear
+                 :weights '(1 0)
+                 :fetch-k 5)))
+    (rag-protocol:upsert store
+                         (list (%chunk "a" "red apple" (%vec 1 0))
+                               (%chunk "b" "apple apple apple" (%vec 0 1))))
+    (let ((hits (rag-protocol:query-store
+                 store (%q :text "apple" :embedding (%vec 1 0)) :top-k 2)))
+      (ok (equal "a" (rag-protocol:rag-chunk-id
+                      (rag-protocol:rag-hit-chunk (first hits))))))))
+
 (deftest use-hybrid-binds
   (let ((rag-protocol:*rag-store* nil)
         (dense (rag-protocol:make-mock-vector-store)))

@@ -1,6 +1,6 @@
 (defsystem "rag-backend-hybrid"
-  :version "0.1.0"
-  :description "In-process Okapi BM25 + RRF hybrid store for rag-protocol"
+  :version "0.1.1"
+  :description "In-process Okapi BM25 + RRF/linear hybrid store for rag-protocol"
   :author "egao1980"
   :license "MIT"
   :depends-on ("rag-protocol")
