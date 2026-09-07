@@ -1,25 +1,11 @@
 (in-package #:rag-backend-hybrid)
 
-;;; In-process Okapi BM25 + RRF. Lexical index is not persisted — wrap
-;;; sql/pgvector for vectors; re-ingest after restart. Not tsvector.
+;;; In-process Okapi BM25 + protocol fuse (RRF / linear). Lexical index
+;;; is not persisted — wrap sql/pgvector/tsvector; re-ingest after restart.
 
 (defun tokenize (text)
-  "Lowercase alphanumeric tokens (CL characters). Empty / NIL → ()."
-  (let ((s (string-downcase (or text "")))
-        (out '())
-        (start nil))
-    (loop for i from 0 below (length s)
-          for c = (char s i)
-          for alnum = (alphanumericp c)
-          do (cond
-               ((and alnum (null start))
-                (setf start i))
-               ((and (not alnum) start)
-                (push (subseq s start i) out)
-                (setf start nil)))
-          finally (when start
-                    (push (subseq s start) out)))
-    (nreverse out)))
+  "Lowercase alphanumeric tokens. Delegates to rag-protocol:tokenize."
+  (rag-protocol:tokenize text))
 
 (defun %unique (items)
   (let ((seen (make-hash-table :test 'equal))
@@ -49,25 +35,19 @@
     (t nil)))
 
 (defun rrf-fuse (hit-lists &key (k 60) top-k)
-  "Reciprocal rank fusion. Earlier lists win chunk identity on id collision."
-  (let ((scores (make-hash-table :test 'equal))
-        (chunks (make-hash-table :test 'equal)))
-    (dolist (hits hit-lists)
-      (loop for hit in hits
-            for rank from 1
-            for chunk = (rag-protocol:rag-hit-chunk hit)
-            for id = (rag-protocol:rag-chunk-id chunk)
-            do (unless (gethash id chunks)
-                 (setf (gethash id chunks) chunk))
-               (incf (gethash id scores 0f0)
-                     (float (/ 1d0 (+ k rank)) 1f0))))
-    (let ((hits (loop for id being the hash-keys of scores
-                      using (hash-value score)
-                      collect (rag-protocol:make-rag-hit
-                               :chunk (gethash id chunks)
-                               :score score))))
-      (rag-protocol:rerank (rag-protocol:make-identity-reranker)
-                           nil hits :top-k (or top-k (hash-table-count scores))))))
+  "Reciprocal rank fusion. Delegates to rag-protocol:rrf-fuse."
+  (rag-protocol:rrf-fuse hit-lists :k k :top-k top-k))
+
+(defun linear-fuse (hit-lists &key weights top-k)
+  "Weighted linear fusion. Delegates to rag-protocol:linear-fuse."
+  (rag-protocol:linear-fuse hit-lists :weights weights :top-k top-k))
+
+(defun %coerce-fusion (fusion &key rrf-k weights)
+  (etypecase fusion
+    (null (rag-protocol:make-rrf-fusion :k rrf-k))
+    (rag-protocol:rag-fusion fusion)
+    ((eql :rrf) (rag-protocol:make-rrf-fusion :k rrf-k))
+    ((eql :linear) (rag-protocol:make-linear-fusion :weights weights))))
 
 (defstruct (bm25-doc (:conc-name bdoc-))
   chunk
@@ -81,10 +61,16 @@
    (n :initform 0 :accessor bm25-n)
    (total-dl :initform 0 :accessor bm25-total-dl)
    (k1 :initarg :k1 :accessor bm25-k1 :initform 1.2)
-   (b :initarg :b :accessor bm25-b :initform 0.75)))
+   (b :initarg :b :accessor bm25-b :initform 0.75)
+   (analyzer :initarg :analyzer :accessor bm25-analyzer :initform nil)))
 
-(defun make-bm25-store (&key (k1 1.2) (b 0.75))
-  (make-instance 'bm25-store :k1 k1 :b b))
+(defun make-bm25-store (&key (k1 1.2) (b 0.75) analyzer)
+  (make-instance 'bm25-store :k1 k1 :b b :analyzer analyzer))
+
+(defun %analyze (store text)
+  (rag-protocol:analyze (or (bm25-analyzer store)
+                            (rag-protocol:make-simple-analyzer))
+                        text))
 
 (defun use-bm25-store (&rest args &key &allow-other-keys)
   (setf rag-protocol:*rag-store* (apply #'make-bm25-store args)))
@@ -115,7 +101,7 @@
   (unless (rag-protocol:rag-chunk-id chunk)
     (error 'rag-protocol:rag-error :message "chunk id required for upsert"))
   (let* ((id (rag-protocol:rag-chunk-id chunk))
-         (tokens (tokenize (rag-protocol:rag-chunk-text chunk)))
+         (tokens (%analyze store (rag-protocol:rag-chunk-text chunk)))
          (tf (%term-tf tokens))
          (dl (length tokens)))
     (%unindex store id)
@@ -186,7 +172,7 @@
 
 (defmethod rag-protocol:query-store ((store bm25-store) query &key top-k filter)
   (let* ((text (%query-text query))
-         (terms (%unique (tokenize text))))
+         (terms (%unique (%analyze store text))))
     (unless (and text (plusp (length text)))
       (error 'rag-protocol:rag-error :message "bm25 query needs text"))
     (let ((hits '()))
@@ -205,17 +191,26 @@
 (defclass hybrid-store (rag-protocol:rag-vector-store)
   ((vector-store :initarg :vector-store :accessor hybrid-store-vector-store)
    (bm25 :initarg :bm25 :accessor hybrid-store-bm25)
+   (fusion :initarg :fusion :accessor hybrid-store-fusion)
    (rrf-k :initarg :rrf-k :accessor hybrid-store-rrf-k :initform 60)
    (fetch-k :initarg :fetch-k :accessor hybrid-store-fetch-k :initform 20)))
 
-(defun make-hybrid-store (&key vector-store bm25 (rrf-k 60) (fetch-k 20)
-                               (k1 1.2) (b 0.75))
+(defun hybrid-store-lexical-store (store)
+  (hybrid-store-bm25 store))
+
+(defun make-hybrid-store (&key vector-store bm25 lexical-store
+                               fusion analyzer
+                               (rrf-k 60) (fetch-k 20)
+                               (k1 1.2) (b 0.75)
+                               weights)
   (unless vector-store
     (error 'rag-protocol:rag-error
            :message "hybrid-store needs :vector-store"))
   (make-instance 'hybrid-store
                  :vector-store vector-store
-                 :bm25 (or bm25 (make-bm25-store :k1 k1 :b b))
+                 :bm25 (or lexical-store bm25
+                           (make-bm25-store :k1 k1 :b b :analyzer analyzer))
+                 :fusion (%coerce-fusion fusion :rrf-k rrf-k :weights weights)
                  :rrf-k rrf-k
                  :fetch-k fetch-k))
 
@@ -248,9 +243,11 @@
     (when vec
       (setf dense (rag-protocol:query-store (hybrid-store-vector-store store)
                                             query :top-k fk :filter filter)))
-    (when (and text (plusp (length (tokenize text))))
+    (when (and text (plusp (length text)))
       (setf lex (rag-protocol:query-store (hybrid-store-bm25 store)
                                           query :top-k fk :filter filter)))
-    (rrf-fuse (remove nil (list dense lex))
-              :k (hybrid-store-rrf-k store)
-              :top-k k)))
+    (rag-protocol:fuse (or (hybrid-store-fusion store)
+                           (rag-protocol:make-rrf-fusion
+                            :k (hybrid-store-rrf-k store)))
+                       (remove nil (list dense lex))
+                       :top-k k)))
